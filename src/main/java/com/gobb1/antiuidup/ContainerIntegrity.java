@@ -1,25 +1,22 @@
 package com.gobb1.antiuidup;
 
-import com.mojang.logging.LogUtils;
+import com.gobb1.antiuidup.config.AntiUiDupConfig;
+import com.gobb1.antiuidup.logging.AuditLogger;
+import com.gobb1.antiuidup.webhook.DiscordWebhook;
+import com.gobb1.antiuidup.webhook.WebhookLimiter;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
-import org.slf4j.Logger;
 
-import java.util.Set;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class ContainerIntegrity {
     private ContainerIntegrity() {}
 
-    private static final Logger LOGGER = LogUtils.getLogger();
+    private static volatile AntiUiDupConfig CFG = new AntiUiDupConfig();
     private static final Map<UUID, State> STATES = new ConcurrentHashMap<>();
-
-    private static final long OPEN_GRACE_MS = 350;
-
-    private static final int MAX_VIOLATIONS_IN_WINDOW = 3;
-    private static final long WINDOW_MS = 2500;
 
     private static final Set<String> IGNORED_VANILLA_MENU_SIMPLE_NAMES = Set.of(
             "CraftingMenu",
@@ -46,6 +43,27 @@ public final class ContainerIntegrity {
             "ShulkerBoxMenu"
     );
 
+    public static void applyConfig(AntiUiDupConfig cfg) {
+        if (cfg != null) CFG = cfg;
+    }
+
+    private static long openGraceMs() { return Math.max(0L, CFG.openGraceMs); }
+    private static long windowMs() { return Math.max(200L, CFG.windowMs); }
+    private static int maxViolations() { return Math.max(1, CFG.maxViolationsInWindow); }
+
+    private static void webhook(ServerPlayer p, String message) {
+        if (!CFG.webhookEnabled) return;
+        if (CFG.discordWebhookUrl == null || CFG.discordWebhookUrl.isBlank()) return;
+        if (!WebhookLimiter.canSend(p.getUUID(), CFG.webhookCooldownSeconds)) return;
+
+        String prefix = CFG.webhookIncludeServerName ? ("[" + CFG.serverName + "] ") : "";
+        DiscordWebhook.send(CFG.discordWebhookUrl, prefix + message);
+    }
+
+    private static String playerTag(ServerPlayer p) {
+        return p.getGameProfile().getName() + " (" + p.getUUID() + ")";
+    }
+
     public static boolean hasOpenMenu(ServerPlayer p) {
         return p.containerMenu != p.inventoryMenu;
     }
@@ -60,74 +78,6 @@ public final class ContainerIntegrity {
         s.resetWindow();
     }
 
-    public static boolean validateContainerPacket(ServerPlayer p, int packetContainerId, String kind) {
-        int expected = currentContainerId(p);
-        if (packetContainerId == expected) return true;
-
-        forceClose(p, "invalid_container_id:" + kind);
-
-        int v = addViolation(p);
-        LOGGER.warn("[ContainerIntegrity] {} invalid {}: packetId={} expectedId={} v={}",
-                p.getGameProfile().getName(), kind, packetContainerId, expected, v
-        );
-
-        if (v >= MAX_VIOLATIONS_IN_WINDOW) {
-            p.connection.disconnect(Component.literal("Desync/invalid container packets."));
-        }
-        return false;
-    }
-
-    /**
-     * Regra global: recebeu ação "do mundo" enquanto servidor acha que menu está aberto.
-     * Fecha o menu no servidor, incrementa violações e retorna true para você CANCELAR o pacote.
-     *
-     * Use ignoreVanillaMenus=true só para checks que podem ter falso positivo.
-     */
-    public static boolean onIllegalWorldAction(ServerPlayer p, String kind, boolean ignoreVanillaMenus) {
-        if (!hasOpenMenu(p)) return false;
-
-        if (ignoreVanillaMenus && isIgnoredVanillaMenu(p)) return false;
-
-        State s = STATES.computeIfAbsent(p.getUUID(), k -> new State());
-        long now = System.currentTimeMillis();
-        long sinceOpen = now - s.lastMenuOpenAtMs;
-
-        boolean isGrace = sinceOpen >= 0 && sinceOpen < OPEN_GRACE_MS;
-        boolean isOpenNoiseKind = kind.equals("interact_entity") || kind.equals("use_item_on");
-
-        if (isGrace && isOpenNoiseKind) {
-            return true;
-        }
-
-        int containerId = currentContainerId(p);
-        p.closeContainer();
-        onMenuClosed(p);
-
-        int v = s.addViolation();
-        LOGGER.warn("[ContainerIntegrity] {} illegal action while menu open: {} (containerId={}) v={}",
-                p.getGameProfile().getName(), kind, containerId, v
-        );
-
-        if (v >= MAX_VIOLATIONS_IN_WINDOW) {
-            p.connection.disconnect(Component.literal("Desync/illegal actions while menu open."));
-        }
-        return true;
-    }
-
-    public static void onDisconnect(ServerPlayer p) {
-        STATES.remove(p.getUUID());
-    }
-
-
-    public static void closeOnContextChange(ServerPlayer p, String reason) {
-        if (!hasOpenMenu(p)) return;
-
-        LOGGER.info("[ContainerIntegrity] Closing menu for {} due to context change: {} (containerId={})",
-                p.getGameProfile().getName(), reason, currentContainerId(p)
-        );
-        forceClose(p, "context_change:" + reason);
-    }
-
     public static void onMenuOpened(ServerPlayer p, int containerId) {
         State s = STATES.computeIfAbsent(p.getUUID(), k -> new State());
         s.lastKnownContainerId = containerId;
@@ -135,9 +85,17 @@ public final class ContainerIntegrity {
         s.resetWindow();
     }
 
+    public static void onDisconnect(ServerPlayer p) {
+        STATES.remove(p.getUUID());
+        WebhookLimiter.clear(p.getUUID());
+    }
+
     private static void forceClose(ServerPlayer p, String reason) {
         p.closeContainer();
         onMenuClosed(p);
+
+        AuditLogger.info("[ContainerIntegrity] forceClose player=" + playerTag(p)
+                + " reason=" + reason + " containerId=" + currentContainerId(p));
     }
 
     private static boolean isIgnoredVanillaMenu(ServerPlayer p) {
@@ -147,7 +105,112 @@ public final class ContainerIntegrity {
 
     private static int addViolation(ServerPlayer p) {
         State s = STATES.computeIfAbsent(p.getUUID(), k -> new State());
-        return s.addViolation();
+        return s.addViolation(windowMs());
+    }
+
+    private static void maybeKick(ServerPlayer p, int v, String kickReason, String webhookReason) {
+        if (v < maxViolations()) return;
+
+        if (CFG.webhookOnKick) {
+            webhook(p, "Kick por suspeita de desync: player=" + playerTag(p)
+                    + " reason=" + webhookReason + " violations=" + v);
+        }
+
+        p.connection.disconnect(Component.literal(kickReason));
+    }
+
+    public static boolean validateContainerPacket(ServerPlayer p, int packetContainerId, String kind) {
+        if (!CFG.enabled) return true;
+
+        int expected = currentContainerId(p);
+        if (packetContainerId == expected) return true;
+
+        forceClose(p, "invalid_container_id:" + kind);
+
+        int v = addViolation(p);
+
+        String log = "[ContainerIntegrity] invalid_container_id player=" + playerTag(p)
+                + " kind=" + kind
+                + " packetId=" + packetContainerId
+                + " expectedId=" + expected
+                + " menu=" + p.containerMenu.getClass().getName()
+                + " v=" + v;
+
+        AuditLogger.warn(log);
+
+        if (CFG.webhookOnInvalidContainerId) {
+            webhook(p, "Suspeito: invalid_container_id\n"
+                    + "player: " + playerTag(p) + "\n"
+                    + "kind: " + kind + "\n"
+                    + "packetId: " + packetContainerId + "\n"
+                    + "expectedId: " + expected + "\n"
+                    + "menu: " + p.containerMenu.getClass().getName() + "\n"
+                    + "v: " + v);
+        }
+
+        maybeKick(p, v, "Desync/invalid container packets.", "invalid_container_id:" + kind);
+        return false;
+    }
+
+    public static boolean onIllegalWorldAction(ServerPlayer p, String kind, boolean ignoreVanillaMenus) {
+        if (!CFG.enabled) return false;
+        if (!hasOpenMenu(p)) return false;
+
+        if (ignoreVanillaMenus && isIgnoredVanillaMenu(p)) {
+            return false;
+        }
+
+        State s = STATES.computeIfAbsent(p.getUUID(), k -> new State());
+        long now = System.currentTimeMillis();
+        long sinceOpen = now - s.lastMenuOpenAtMs;
+
+        boolean isGrace = sinceOpen >= 0 && sinceOpen < openGraceMs();
+        boolean isOpenNoiseKind = kind.equals("interact_entity") || kind.equals("use_item_on");
+
+        if (isGrace && isOpenNoiseKind) {
+            return true;
+        }
+
+        int containerId = currentContainerId(p);
+        String menuClass = p.containerMenu.getClass().getName();
+
+        p.closeContainer();
+        onMenuClosed(p);
+
+        int v = s.addViolation(windowMs());
+
+        String log = "[ContainerIntegrity] illegal_world_action player=" + playerTag(p)
+                + " kind=" + kind
+                + " containerId=" + containerId
+                + " menu=" + menuClass
+                + " v=" + v;
+
+        AuditLogger.warn(log);
+
+        if (CFG.webhookOnIllegalWorldAction) {
+            webhook(p, "Suspeito: illegal_world_action\n"
+                    + "player: " + playerTag(p) + "\n"
+                    + "kind: " + kind + "\n"
+                    + "containerId: " + containerId + "\n"
+                    + "menu: " + menuClass + "\n"
+                    + "v: " + v);
+        }
+
+        maybeKick(p, v, "Desync/illegal actions while menu open.", "illegal_world_action:" + kind);
+        return true;
+    }
+
+    public static void closeOnContextChange(ServerPlayer p, String reason) {
+        if (!CFG.enabled) return;
+        if (!hasOpenMenu(p)) return;
+
+        AuditLogger.info("[ContainerIntegrity] context_close player=" + playerTag(p)
+                + " reason=" + reason
+                + " containerId=" + currentContainerId(p)
+                + " menu=" + p.containerMenu.getClass().getName());
+
+        p.closeContainer();
+        onMenuClosed(p);
     }
 
     private static final class State {
@@ -163,9 +226,9 @@ public final class ContainerIntegrity {
             violationsInWindow = 0;
         }
 
-        int addViolation() {
+        int addViolation(long windowMs) {
             long now = System.currentTimeMillis();
-            if (now - windowStart > WINDOW_MS) {
+            if (now - windowStart > windowMs) {
                 windowStart = now;
                 violationsInWindow = 0;
             }
