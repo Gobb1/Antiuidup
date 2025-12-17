@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "com.gobb1.antiuidup.mixins",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ServerGamePacketListenerImpl_ContainerGuardMixin",
+    "ServerGamePacketListenerImpl_ContextCloseMixin",
+    "ServerGamePacketListenerImpl_DropHotbarGuardMixin",
+    "ServerGamePacketListenerImpl_IllegalWhileMenuMixin",
+    "ServerPlayer_OpenMenuMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
